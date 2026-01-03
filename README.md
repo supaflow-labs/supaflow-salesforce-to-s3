@@ -1,11 +1,5 @@
-<!--
-README goals:
-- 10-minute happy path
-- Full configuration reference
-- Clear defaults + cost + security notes
--->
 
-> **Status:** Production-ready reference implementation. PRs welcome.
+## Table of Contents
 
 - [What this does](#what-this-does)
 - [Why you'll like this](#why-youll-like-this)
@@ -18,6 +12,7 @@ README goals:
 - [Full Refresh for No-Cursor Objects](#full-refresh-for-no-cursor-objects)
 - [Security](#security)
 - [Costs](#costs)
+- [Querying with Athena](#querying-with-athena)
 - [Operational guide](#operational-guide)
 - [Troubleshooting](#troubleshooting)
 - [Local Testing](#local-testing)
@@ -110,7 +105,12 @@ PollLoop:
                 → No: Continue
     ↓
 ReleaseLock
+    ↓
+StartGlueCrawler
+    → Update Glue Data Catalog with new tables/partitions
 ```
+
+After a successful export, Step Functions triggers the Glue Crawler to update schemas and partitions automatically.
 
 **Benefits over sequential processing:**
 - Jobs submitted in parallel (up to 15, Salesforce limit)
@@ -122,7 +122,7 @@ ReleaseLock
 
 - AWS SAM CLI
 - Python 3.11+
-- AWS credentials with permissions to deploy Lambda, Step Functions, DynamoDB, EventBridge, and IAM roles
+- AWS credentials with permissions to create IAM roles/policies (required for SAM deploy)
 - A Salesforce org with API access enabled (Bulk API 2.0)
 - Salesforce credentials (username, password, security token)
 
@@ -142,6 +142,8 @@ This script will:
 5. Set a default output bucket name (`salesforce-export-<account>-<region>`) unless you override it
 6. Build and deploy the Lambda + Step Functions
 7. Optionally start a test execution
+
+After the first successful run, the Glue Crawler populates the `salesforce_export` database so you can query immediately in Athena.
 
 ### Non-Interactive Deployment
 
@@ -185,7 +187,7 @@ Helper scripts for managing Step Functions executions:
 # Reset all state (forces full re-sync on next run)
 ./scripts/reset.sh
 
-# Completely uninstall (delete stack, DynamoDB tables, S3 bucket, everything)
+# Completely uninstall (deletes stack and state tables; deletes S3 bucket only if auto-created)
 ./scripts/uninstall.sh
 ```
 
@@ -324,6 +326,12 @@ Value               supaflow-salesforce-to-s3-StateTable-XXXXX
 
 Key                 OutputBucketName
 Value               supaflow-salesforce-to-s3-outputbucket-XXXXX
+
+Key                 GlueDatabaseName
+Value               salesforce_export
+
+Key                 GlueCrawlerName
+Value               supaflow-salesforce-to-s3-crawler
 ```
 
 ### Step 7: Start a Manual Execution (Optional)
@@ -621,19 +629,18 @@ The Glue Crawler runs automatically at the end of each successful export:
 - Adds new partitions for each run
 - Updates column types if schema changes
 
-To run the crawler manually:
+To run the crawler manually (use GlueCrawlerName from stack outputs):
 ```bash
-aws glue start-crawler --name <stack-name>-crawler
+aws glue start-crawler --name supaflow-salesforce-to-s3-crawler
 ```
 
 ## Operational Guide
 
 ### What happens on Salesforce rate limits
 
-- **During acquire_lock**: the run is skipped and recorded as `RATE_LIMITED` in DynamoDB. No jobs are submitted.
-- **During job polling**: the state machine calls `limit_run`, records `RATE_LIMITED`, and exits early.
-- **During result fetch**: the run is marked `RATE_LIMITED`, fetch errors are recorded, and the run finishes with
-  `RATE_LIMITED` preserved (not overwritten by `COMPLETED`).
+- **Before submitting jobs**: the run exits early and is recorded as `RATE_LIMITED`. No jobs are submitted.
+- **During job polling**: the state machine records `RATE_LIMITED` and exits early.
+- **During result fetch**: the run is marked `RATE_LIMITED`, fetch errors are recorded, and the status is preserved (not overwritten by `COMPLETED`).
 
 **Recovery behavior**
 - `RATE_LIMITED` is not an error - it's a controlled exit so the next schedule resumes without advancing cursors.
@@ -970,12 +977,13 @@ sam deploy --parameter-overrides SalesforceLoginUrl="https://mycompany.my.salesf
 ├── statemachine.asl.yaml   # Step Functions definition
 ├── template.yaml           # SAM/CloudFormation template
 ├── samconfig.toml          # SAM deployment configuration
-├── install.sh               # Interactive deployment script
+├── install.sh              # Interactive deployment script
 ├── requirements-dev.txt    # Local dev/test dependencies
 ├── .env.example            # Template for credentials
 ├── .gitignore
 └── README.md
 ```
+
 ## FAQ
 
 **Does this overwrite previous exports?**  
