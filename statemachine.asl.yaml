@@ -1,0 +1,359 @@
+Comment: Salesforce to S3 export with batch polling
+StartAt: AcquireLock
+States:
+  AcquireLock:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: acquire_lock
+        execution_arn.$: $$.Execution.Id
+    ResultSelector:
+      skip.$: $.Payload.skip
+      run_id.$: $.Payload.run_id
+      run_started_at.$: $.Payload.run_started_at
+      objects.$: $.Payload.objects
+    ResultPath: $.acquire
+    Next: ShouldSkip
+
+  ShouldSkip:
+    Type: Choice
+    Choices:
+      - Variable: $.acquire.skip
+        BooleanEquals: true
+        Next: SkipDone
+    Default: StartJobs
+
+  SkipDone:
+    Type: Succeed
+
+  # Phase 1: Submit jobs in parallel (up to 15 concurrent)
+  StartJobs:
+    Type: Map
+    ItemsPath: $.acquire.objects
+    MaxConcurrency: 15
+    ItemSelector:
+      object_name.$: $$.Map.Item.Value
+      run_id.$: $.acquire.run_id
+      run_started_at.$: $.acquire.run_started_at
+    ItemProcessor:
+      ProcessorConfig:
+        Mode: INLINE
+      StartAt: StartJob
+      States:
+        StartJob:
+          Type: Task
+          Resource: arn:aws:states:::lambda:invoke
+          Parameters:
+            FunctionName: ${WorkerFunction}
+            Payload:
+              action: start_job
+              object_name.$: $.object_name
+              run_id.$: $.run_id
+              run_started_at.$: $.run_started_at
+          ResultSelector:
+            skip.$: $.Payload.skip
+            reason.$: $.Payload.reason
+            object_name.$: $.Payload.object_name
+            job_id.$: $.Payload.job_id
+            incremental_field.$: $.Payload.incremental_field
+            refresh_mode.$: $.Payload.refresh_mode
+            run_started_at.$: $.Payload.run_started_at
+          ResultPath: $.job
+          OutputPath: $.job
+          End: true
+    ResultPath: $.jobs
+    Next: FilterActiveJobs
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        ResultPath: $.error
+        Next: FailRun
+
+  # Filter out skipped jobs, keep only jobs with job_id
+  FilterActiveJobs:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: filter_active_jobs
+        jobs.$: $.jobs
+        run_id.$: $.acquire.run_id
+        run_started_at.$: $.acquire.run_started_at
+    ResultSelector:
+      run_id.$: $.Payload.run_id
+      run_started_at.$: $.Payload.run_started_at
+      jobs.$: $.Payload.jobs
+    ResultPath: $
+    Next: InitPollLoop
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        ResultPath: $.error
+        Next: FailRunFromFilter
+
+  FailRunFromFilter:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: fail_run
+        run_id.$: $.acquire.run_id
+        error.$: $.error.Error
+        cause.$: $.error.Cause
+    ResultPath: $.fail
+    Next: Failed
+
+  # Initialize polling state
+  InitPollLoop:
+    Type: Pass
+    Parameters:
+      run_id.$: $.run_id
+      run_started_at.$: $.run_started_at
+      has_pending: true
+    Next: HasPendingJobs
+
+  # Check if there are pending jobs to poll
+  HasPendingJobs:
+    Type: Choice
+    Choices:
+      - Variable: $.has_pending
+        BooleanEquals: true
+        Next: CheckJobsBatch
+    Default: ReleaseLock
+
+  # Phase 2: Check status of all pending jobs in one call
+  # Jobs are read from DynamoDB to avoid 256KB state limit
+  CheckJobsBatch:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: check_jobs_batch
+        run_id.$: $.run_id
+        run_started_at.$: $.run_started_at
+    ResultSelector:
+      completed.$: $.Payload.completed
+      has_pending.$: $.Payload.has_pending
+      rate_limited.$: $.Payload.rate_limited
+    ResultPath: $.batch
+    Next: CheckRateLimited
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        ResultPath: $.error
+        Next: FailRunFromPoll
+
+  FailRunFromPoll:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: fail_run
+        run_id.$: $.run_id
+        error.$: $.error.Error
+        cause.$: $.error.Cause
+    ResultPath: $.fail
+    Next: Failed
+
+  CheckRateLimited:
+    Type: Choice
+    Choices:
+      - Variable: $.batch.rate_limited
+        BooleanEquals: true
+        Next: HandleRateLimit
+    Default: ProcessCompletedJobs
+
+  # Phase 3: Fetch results for completed jobs (up to 4 concurrent)
+  # ResultPath: null discards results to avoid 256KB state limit
+  # Failures are logged and tracked in DynamoDB by the Lambda
+  ProcessCompletedJobs:
+    Type: Map
+    ItemsPath: $.batch.completed
+    MaxConcurrency: 4
+    ItemSelector:
+      job_id.$: $$.Map.Item.Value.job_id
+      object_name.$: $$.Map.Item.Value.object_name
+      incremental_field.$: $$.Map.Item.Value.incremental_field
+      refresh_mode.$: $$.Map.Item.Value.refresh_mode
+      run_started_at.$: $$.Map.Item.Value.run_started_at
+      record_count.$: $$.Map.Item.Value.record_count
+      run_id.$: $.run_id
+    ItemProcessor:
+      ProcessorConfig:
+        Mode: INLINE
+      StartAt: FetchObject
+      States:
+        FetchObject:
+          Type: Task
+          Resource: arn:aws:states:::lambda:invoke
+          Parameters:
+            FunctionName: ${WorkerFunction}
+            Payload:
+              action: fetch_object
+              job_id.$: $.job_id
+              object_name.$: $.object_name
+              run_id.$: $.run_id
+              run_started_at.$: $.run_started_at
+              incremental_field.$: $.incremental_field
+              refresh_mode.$: $.refresh_mode
+              record_count.$: $.record_count
+          ResultPath: null
+          End: true
+          Catch:
+            - ErrorEquals:
+                - States.ALL
+              ResultPath: $.error
+              Next: RecordFetchFailure
+        RecordFetchFailure:
+          Type: Task
+          Resource: arn:aws:states:::lambda:invoke
+          Parameters:
+            FunctionName: ${WorkerFunction}
+            Payload:
+              action: record_fetch_failure
+              object_name.$: $.object_name
+              run_id.$: $.run_id
+              error.$: $.error.Error
+              cause.$: $.error.Cause
+          ResultPath: null
+          End: true
+    ResultPath: null
+    Next: UpdatePollState
+    Catch:
+      - ErrorEquals:
+          - States.ALL
+        ResultPath: $.error
+        Next: FailRunFromProcess
+
+  FailRunFromProcess:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: fail_run
+        run_id.$: $.run_id
+        error.$: $.error.Error
+        cause.$: $.error.Cause
+    ResultPath: $.fail
+    Next: Failed
+
+  # Update state for next poll iteration
+  UpdatePollState:
+    Type: Pass
+    Parameters:
+      run_id.$: $.run_id
+      run_started_at.$: $.run_started_at
+      has_pending.$: $.batch.has_pending
+    Next: HasMorePending
+
+  HasMorePending:
+    Type: Choice
+    Choices:
+      - Variable: $.has_pending
+        BooleanEquals: true
+        Next: WaitBeforePoll
+    Default: ReleaseLock
+
+  WaitBeforePoll:
+    Type: Wait
+    Seconds: ${PollSeconds}
+    Next: CheckJobsBatch
+
+  # Rate limit handling
+  HandleRateLimit:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: limit_run
+        run_id.$: $.run_id
+        error: RateLimitError
+        cause: API rate limit exceeded during job polling
+    ResultPath: $.rate_limited
+    Next: RateLimitedDone
+
+  RateLimitedDone:
+    Type: Succeed
+
+  # Error handling
+  FailRun:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: fail_run
+        run_id.$: $.acquire.run_id
+        error.$: $.error.Error
+        cause.$: $.error.Cause
+    ResultPath: $.fail
+    Next: Failed
+
+  Failed:
+    Type: Fail
+    Error: ExportFailed
+    Cause: Export run failed
+
+  # Success path
+  ReleaseLock:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: release_lock
+        run_id.$: $.run_id
+    ResultPath: $.release
+    Next: StartGlueCrawler
+
+  # Update Glue catalog with new partitions
+  StartGlueCrawler:
+    Type: Task
+    Resource: arn:aws:states:::aws-sdk:glue:startCrawler
+    Parameters:
+      Name: ${GlueCrawlerName}
+    ResultPath: $.crawler
+    Catch:
+      - ErrorEquals:
+          - Glue.CrawlerRunningException
+        ResultPath: $.crawlerError
+        Next: CrawlerAlreadyRunning
+      - ErrorEquals:
+          - States.ALL
+        ResultPath: $.crawlerError
+        Next: CrawlerFailed
+    Next: RecordCrawlerStarted
+
+  RecordCrawlerStarted:
+    Type: Task
+    Resource: arn:aws:states:::lambda:invoke
+    Parameters:
+      FunctionName: ${WorkerFunction}
+      Payload:
+        action: record_crawler_started
+        run_id.$: $.run_id
+    ResultPath: $.crawlerRecorded
+    Next: ExportComplete
+
+  CrawlerAlreadyRunning:
+    Type: Pass
+    Result: "Crawler already running, skipping"
+    ResultPath: $.crawlerStatus
+    Next: ExportComplete
+
+  CrawlerFailed:
+    Type: Pass
+    Result: "Crawler failed to start, export still succeeded"
+    ResultPath: $.crawlerStatus
+    Next: ExportComplete
+
+  ExportComplete:
+    Type: Succeed

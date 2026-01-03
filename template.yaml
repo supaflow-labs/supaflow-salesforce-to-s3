@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Salesforce to S3 export using Step Functions
+
+Parameters:
+  OutputBucketName:
+    Type: String
+    Default: ""
+    Description: "Existing S3 bucket name for exports (leave empty to create)"
+  OutputPrefix:
+    Type: String
+    Default: "salesforce-export"
+    Description: "S3 prefix for export files"
+  ScheduleExpression:
+    Type: String
+    Default: "rate(1 day)"
+    Description: "EventBridge schedule for starting a run"
+  SalesforceUsernameParam:
+    Type: String
+    Default: "/salesforce/username"
+  SalesforcePasswordParam:
+    Type: String
+    Default: "/salesforce/password"
+  SalesforceTokenParam:
+    Type: String
+    Default: "/salesforce/security_token"
+  SalesforceLoginUrl:
+    Type: String
+    Default: "https://login.salesforce.com"
+  SalesforceApiVersion:
+    Type: String
+    Default: "63.0"
+  RunLockTtlHours:
+    Type: Number
+    Default: 24
+  MaxRecordsPerPage:
+    Type: Number
+    Default: 10000
+  PollSeconds:
+    Type: Number
+    Default: 10
+  LookbackSeconds:
+    Type: Number
+    Default: 0
+  FullRefreshIntervalMinutes:
+    Type: Number
+    Default: 1440
+    Description: "Full refresh interval for no-cursor objects (-1=skip, 0=every run, >0=minutes)"
+  ObjectAllowlist:
+    Type: String
+    Default: "Account,Contact,Lead,Opportunity,Case,User,UserRole,Profile,Group,GroupMember,PermissionSet,PermissionSetAssignment,Product2,Pricebook2,PricebookEntry,Document,EmailTemplate,Solution,Entitlement,BusinessHours"
+    Description: "Comma-separated list of objects to sync (empty = all objects)"
+
+Conditions:
+  CreateBucket: !Equals [!Ref OutputBucketName, ""]
+
+Resources:
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    Properties:
+      BucketName: !Sub "salesforce-export-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  RunControlTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1-runs-by-time-v2
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: handler.lambda_handler
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTable
+          RUN_CONTROL_TABLE: !Ref RunControlTable
+          OUTPUT_BUCKET: !If [CreateBucket, !Ref OutputBucket, !Ref OutputBucketName]
+          OUTPUT_PREFIX: !Ref OutputPrefix
+          SF_USERNAME_PARAM: !Ref SalesforceUsernameParam
+          SF_PASSWORD_PARAM: !Ref SalesforcePasswordParam
+          SF_TOKEN_PARAM: !Ref SalesforceTokenParam
+          SF_LOGIN_URL: !Ref SalesforceLoginUrl
+          SF_API_VERSION: !Ref SalesforceApiVersion
+          RUN_LOCK_TTL_HOURS: !Ref RunLockTtlHours
+          MAX_RECORDS: !Ref MaxRecordsPerPage
+          LOOKBACK_SECONDS: !Ref LookbackSeconds
+          FULL_REFRESH_INTERVAL_MINUTES: !Ref FullRefreshIntervalMinutes
+          OBJECT_ALLOWLIST: !Ref ObjectAllowlist
+          HTTP_MAX_RETRIES: "3"
+          HTTP_RETRY_BASE_SECONDS: "1"
+          HTTP_RETRY_MAX_SECONDS: "30"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RunControlTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SalesforceUsernameParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SalesforcePasswordParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SalesforceTokenParam}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource:
+                - !If
+                  - CreateBucket
+                  - !Sub arn:aws:s3:::${OutputBucket}/*
+                  - !Sub arn:aws:s3:::${OutputBucketName}/*
+
+  ExportStateMachine:
+    Type: AWS::Serverless::StateMachine
+    DependsOn: GlueCrawler
+    Properties:
+      DefinitionUri: statemachine.asl.yaml
+      DefinitionSubstitutions:
+        WorkerFunction: !GetAtt WorkerFunction.Arn
+        PollSeconds: !Ref PollSeconds
+        GlueCrawlerName: !Ref GlueCrawler
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WorkerFunction
+        - Statement:
+            - Effect: Allow
+              Action: glue:StartCrawler
+              Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${GlueCrawler}
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ExportStateMachine
+          Id: StartExportStateMachine
+          RoleArn: !GetAtt EventsToStepFunctionsRole.Arn
+
+  EventsToStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ExportStateMachine
+
+  # Glue resources for automatic schema discovery
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: salesforce_export
+        Description: Salesforce export data from S3
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !If
+                    - CreateBucket
+                    - !Sub arn:aws:s3:::${OutputBucket}
+                    - !Sub arn:aws:s3:::${OutputBucketName}
+                  - !If
+                    - CreateBucket
+                    - !Sub arn:aws:s3:::${OutputBucket}/*
+                    - !Sub arn:aws:s3:::${OutputBucketName}/*
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub
+              - s3://${Bucket}/${Prefix}/
+              - Bucket: !If [CreateBucket, !Ref OutputBucket, !Ref OutputBucketName]
+                Prefix: !Ref OutputPrefix
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: '{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}'
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref ExportStateMachine
+  RunStateTable:
+    Value: !Ref StateTable
+  RunControlTable:
+    Value: !Ref RunControlTable
+  OutputBucketName:
+    Value: !If [CreateBucket, !Ref OutputBucket, !Ref OutputBucketName]
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+  GlueCrawlerName:
+    Value: !Ref GlueCrawler
