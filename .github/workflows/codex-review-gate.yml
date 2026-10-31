@@ -65,6 +65,15 @@ jobs:
               if (!numbers.length) return;
               let unresolved = false;
               for (const issue_number of numbers) {
+                // The summary attests the head, not the reviewed base. A retargeted
+                // PR must be replaced so review evidence cannot cross base branches.
+                const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                  owner, repo, issue_number, per_page: 100
+                });
+                if (timeline.some(event => event.event === 'base_ref_changed')) {
+                  await report('failure', 'PR base changed; open a new PR for fresh review');
+                  return;
+                }
                 const comments = await github.paginate(github.rest.issues.listComments, {
                   owner, repo, issue_number, per_page: 100
                 });
