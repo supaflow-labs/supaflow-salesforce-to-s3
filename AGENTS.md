@@ -11,3 +11,5 @@
 - Keep the Codex connector enabled for this repository and request a fresh review when necessary. Missing or incomplete review is not a pass.
 
 - Choose the intended target branch when opening a PR. If its base branch is changed, close it and open a new PR against the intended base; the review gate rejects retargeted PRs because review summaries identify the head but not the reviewed base.
+
+<!-- Temporary review-gate verification; this PR will be closed without merging. -->
