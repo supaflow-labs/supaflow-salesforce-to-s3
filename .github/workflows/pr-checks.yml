@@ -30,4 +30,4 @@ jobs:
         run: |
           python -m compileall -q src
           for script in install.sh scripts/*.sh; do bash -n "$script"; done
-      - run: node --test .github/tests/codex-review-gate.test.cjs
+      - run: node --test .github/tests/codex-review-gate.node.mjs
