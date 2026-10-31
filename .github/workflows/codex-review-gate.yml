@@ -1,0 +1,90 @@
+name: Codex review gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited, closed]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Open PR to re-evaluate without requesting another review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: codex-review
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  evaluate:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout: privileged evaluation executes only this trusted workflow.
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = Number(context.payload.pull_request?.number ||
+              context.payload.issue?.number || context.payload.inputs?.pull_request_number);
+            if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid PR number');
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const groups = new Map();
+            const addGroup = (head, base) => {
+              if (head && ['main', 'prod'].includes(base)) groups.set(`${head}/${base}`, { head, base });
+            };
+            addGroup(pr.head.sha, pr.base.ref);
+            const eventPr = context.payload.pull_request;
+            if (eventPr) {
+              addGroup(eventPr.head.sha, eventPr.base.ref);
+              addGroup(context.payload.before, eventPr.base.ref);
+              addGroup(eventPr.head.sha, context.payload.changes?.base?.ref?.from);
+            }
+            const evaluate = async ({ head, base }) => {
+              const statusContext = `Codex review / ${base}`;
+              const target_url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+              const report = (state, description) => github.rest.repos.createCommitStatus({
+                owner, repo, sha: head, context: statusContext, state, description, target_url
+              });
+              // Invalidate any previous success before reading external evidence. API failures block merges.
+              await report('pending', 'Waiting for completed Codex review of this commit');
+              // A commit status is shared by every PR with this head and target branch.
+              const peers = async () => (await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', base: base, per_page: 100
+              })).filter(p => p.head.sha === head).map(p => p.number).sort((a, b) => a - b);
+              const numbers = await peers();
+              if (!numbers.length) return;
+              let unresolved = false;
+              for (const issue_number of numbers) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner, repo, issue_number, per_page: 100
+                });
+                const summaries = comments.filter(c =>
+                  c.user?.login === 'chatgpt-codex-connector[bot]' && c.user?.type === 'Bot' &&
+                  c.performed_via_github_app?.id === 1144995 &&
+                  (c.body || '').includes('<!-- codex-pull-request-review-summary -->')
+                ).sort((a, b) => b.id - a.id);
+                let state;
+                try {
+                  const match = summaries[0]?.body.match(/<!-- codex-review-state:v1 (.*?) -->/);
+                  if (match) state = JSON.parse(match[1]).code_review;
+                } catch { /* Unknown or malformed evidence remains pending. */ }
+                if (!state || state.commit_sha !== head || state.status !== 'completed' ||
+                    typeof state.has_unresolved_findings !== 'boolean') return;
+                unresolved ||= state.has_unresolved_findings;
+              }
+              // Recheck membership after reading evidence; moved/new PRs require another evaluation.
+              if (JSON.stringify(await peers()) !== JSON.stringify(numbers)) return;
+              await report(unresolved ? 'failure' : 'success', unresolved ?
+                'Resolve Codex findings before merging' : 'Codex completed review; no unresolved findings');
+            };
+            for (const group of groups.values()) await evaluate(group);
