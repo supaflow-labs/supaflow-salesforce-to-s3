@@ -67,10 +67,10 @@ jobs:
               for (const issue_number of numbers) {
                 // The summary attests the head, not the reviewed base. A retargeted
                 // PR must be replaced so review evidence cannot cross base branches.
-                const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                const events = await github.paginate(github.rest.issues.listEvents, {
                   owner, repo, issue_number, per_page: 100
                 });
-                if (timeline.some(event => event.event === 'base_ref_changed')) {
+                if (events.some(event => ['base_ref_changed', 'automatic_base_change_succeeded'].includes(event.event))) {
                   await report('failure', 'PR base changed; open a new PR for fresh review');
                   return;
                 }
