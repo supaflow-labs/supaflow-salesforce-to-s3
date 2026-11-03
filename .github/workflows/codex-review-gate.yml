@@ -15,7 +15,7 @@ on:
 permissions:
   contents: read
   issues: read
-  pull-requests: read
+  pull-requests: write
   statuses: write
 
 concurrency:
@@ -93,6 +93,29 @@ jobs:
               }
               // Recheck membership after reading evidence; moved/new PRs require another evaluation.
               if (JSON.stringify(await peers()) !== JSON.stringify(numbers)) return;
+              if (!unresolved && base === 'main') {
+                for (const pull_number of numbers) {
+                  const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number });
+                  if (current.state !== 'open' || current.draft || current.head.sha !== head ||
+                      current.base.ref !== base) return;
+                  // GitHub disallows self-approval. Leave the PR blocked rather than bypass it.
+                  if (current.user?.login === 'github-actions[bot]') {
+                    await report('failure', 'Approval bot cannot approve its own PR');
+                    return;
+                  }
+                  const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                    owner, repo, pull_number, per_page: 100
+                  });
+                  const alreadyApproved = reviews.some(r =>
+                    r.user?.login === 'github-actions[bot]' && r.user?.type === 'Bot' &&
+                    r.state === 'APPROVED' && r.commit_id === head);
+                  if (!alreadyApproved) await github.rest.pulls.createReview({
+                    owner, repo, pull_number, commit_id: head, event: 'APPROVE',
+                    body: `Automated approval: authenticated Codex review completed for ${head} with no unresolved findings. This is automated review, not independent human approval.`
+                  });
+                }
+                if (JSON.stringify(await peers()) !== JSON.stringify(numbers)) return;
+              }
               await report(unresolved ? 'failure' : 'success', unresolved ?
                 'Resolve Codex findings before merging' : 'Codex completed review; no unresolved findings');
             };
